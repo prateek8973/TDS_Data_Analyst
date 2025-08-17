@@ -1,8 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict
-import asyncio, os, time, uuid
+from typing import List, Dict, Optional
+import asyncio, os, time, uuid, json
 
 from tools import persist_uploads, persist_base64_files
 from agent import build_crew
@@ -13,10 +12,6 @@ os.makedirs(RUN_ROOT, exist_ok=True)
 
 app = FastAPI(title="Agentic Analyst API (FastAPI + CrewAI + Gemini)")
 
-# Optional base64 files model
-class Base64FilesModel(BaseModel):
-    files: Optional[Dict[str, str]] = {}  # default empty dict
-
 class AskResponse(BaseModel):
     answer: str
     elapsed_sec: float
@@ -25,7 +20,7 @@ class AskResponse(BaseModel):
 @app.post("/api/", response_model=AskResponse)
 async def run_agent(
     files: List[UploadFile] = File(...),
-    base64_files: Optional[Base64FilesModel] = None  # optional
+    base64_files: Optional[str] = Form(None)  # JSON string, optional
 ):
     # Ensure questions.txt exists
     qfile = next((f for f in files if f.filename.lower() == "questions.txt"), None)
@@ -34,6 +29,14 @@ async def run_agent(
 
     question = qfile.file.read().decode("utf-8", errors="replace").strip()
     other_files = [f for f in files if f is not qfile]
+
+    # Parse base64_files JSON string if provided
+    base64_dict: Dict[str, str] = {}
+    if base64_files:
+        try:
+            base64_dict = json.loads(base64_files)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="base64_files must be a valid JSON object")
 
     # Create per-request working dir
     run_id = str(uuid.uuid4())
@@ -44,8 +47,8 @@ async def run_agent(
     saved_files = {}
     if other_files:
         saved_files.update(persist_uploads(other_files, workdir))
-    if base64_files and base64_files.files:
-        saved_files.update(persist_base64_files(base64_files.files, workdir))
+    if base64_dict:
+        saved_files.update(persist_base64_files(base64_dict, workdir))
 
     # Build CrewAI agent
     crew = build_crew(workdir=workdir, saved_files=saved_files)
@@ -61,7 +64,6 @@ async def run_agent(
         raise HTTPException(status_code=504, detail="Computation exceeded the 3-minute time budget")
 
     elapsed = time.time() - start
-    # CrewAI result might be wrapped in 'raw' attribute
     answer = str(getattr(result, "raw", result))
 
     return JSONResponse({
