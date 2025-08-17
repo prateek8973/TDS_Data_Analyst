@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+crewai
+crewai-tools
+pydantic
+httpx
+dill
+pandas
+numpy
+matplotlib
+lxml
+pillow
+pypdf
+litellm
+google-generativeai
+langchain-google-genai
