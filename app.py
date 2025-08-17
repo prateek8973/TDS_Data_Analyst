@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
 import asyncio, os, time, uuid, json
-
+from pydantic import BaseModel
 from tools import persist_uploads, persist_base64_files
 from agent import build_crew
 
@@ -74,3 +74,4 @@ async def run_agent(
             "files": list(saved_files.values())
         }
     })
+
