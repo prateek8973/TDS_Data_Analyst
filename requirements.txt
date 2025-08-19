@@ -10,7 +10,11 @@ numpy
 matplotlib
 lxml
 pillow
-pypdf
+pypdf2
+python-docx
 litellm
 google-generativeai
 langchain-google-genai
+easyocr
+pdfplumber
+python-multipart
