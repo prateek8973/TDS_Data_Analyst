@@ -26,16 +26,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 #  Load API keys
-GOOGLE_API_KEYS = [v for k, v in os.environ.items() if k.startswith("GOOGLE_API") and v]
-if not GOOGLE_API_KEYS:
-    raise ValueError("No GOOGLE_API_KEY1/2/3 found in environment")
+# ---- Load dedicated API keys for each agent ----
+AGENT_API_KEYS = {
+    "Planner": os.environ.get("GOOGLE_APIKEY1"),
+    "Developer": os.environ.get("GOOGLE_APIKEY2"),
+    "Reviewer": os.environ.get("GOOGLE_APIKEY3"),
+    "Executor": os.environ.get("GOOGLE_APIKEY4"),
+    "Analyst": os.environ.get("GOOGLE_APIKEY5"),
+}
 
-def get_api_key() -> str:
-    return random.choice(GOOGLE_API_KEYS)
+for agent, key in AGENT_API_KEYS.items():
+    if not key:
+        raise ValueError(f"No API key found for {agent}")
 
-# Gemini LLM wrapper with fallback
+# ---- Gemini LLM wrapper ----
 from litellm import completion
-import re
 
 class GeminiLLM:
     def __init__(self, model="gemini/gemini-1.5-flash", api_key=None, temperature=0):
@@ -44,29 +49,17 @@ class GeminiLLM:
         self.temperature = temperature
 
     def __call__(self, prompt: str, image_base64: str = None):
-        """
-        If image_base64 is provided, sends multimodal request.
-        Otherwise, sends plain text request.
-        """
-
         if image_base64:
-            # multimodal request: text + base64 image
             messages = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{image_base64}"
-                            }
-                        }
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
                     ]
                 }
             ]
         else:
-            # text-only request
             messages = [{"role": "user", "content": prompt}]
 
         try:
@@ -78,7 +71,6 @@ class GeminiLLM:
             )
             return resp["choices"][0]["message"]["content"]
         except Exception as e:
-            # fallback dummy JSON if API fails
             return {
                 "status": "error",
                 "message": "LLM call failed",
@@ -89,11 +81,17 @@ class GeminiLLM:
 def stop_if_answered(output: str) -> bool:
     return "FINAL ANSWER" in output
 
+# ---- Build crew ----
 def build_crew(workdir: str, saved_files: Dict[str, str]):
     all_tools = build_all_tools(workdir=workdir, saved_files=saved_files)
-    chat_llm = GeminiLLM(api_key=get_api_key())
 
-    # Initialize the Code Interpreter tool
+    # Each agent uses its own dedicated LLM instance
+    planner_llm = GeminiLLM(api_key=AGENT_API_KEYS["Planner"])
+    developer_llm = GeminiLLM(api_key=AGENT_API_KEYS["Developer"])
+    reviewer_llm = GeminiLLM(api_key=AGENT_API_KEYS["Reviewer"])
+    executor_llm = GeminiLLM(api_key=AGENT_API_KEYS["Executor"])
+    analyst_llm = GeminiLLM(api_key=AGENT_API_KEYS["Analyst"])
+
     code_interpreter = CodeInterpreterTool()
 
     planner = Agent(
@@ -102,7 +100,7 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         backstory="Expert project planner for data & analysis tasks",
         allow_delegation=False,
         verbose=True,
-        llm=chat_llm,
+        llm=planner_llm,
         memory=False,
         system_prompt="You're a meticulous planning agent...",
         tools=all_tools
@@ -114,7 +112,7 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         backstory="Senior Python engineer",
         allow_delegation=False,
         verbose=True,
-        llm=chat_llm,
+        llm=developer_llm,
         system_prompt="You are a senior Python developer focused on accuracy.",
         tools=all_tools
     )
@@ -125,7 +123,7 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         backstory="Principal engineer",
         allow_delegation=False,
         verbose=True,
-        llm=chat_llm,
+        llm=reviewer_llm,
         system_prompt="You are a strict code reviewer focused on correctness.",
         tools=all_tools
     )
@@ -136,22 +134,22 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         backstory="Execution agent with secure interpreter",
         allow_delegation=False,
         verbose=True,
-        llm=chat_llm,
-        tools=[code_interpreter]  # Exclusive execution tool
+        llm=executor_llm,
+        tools=[code_interpreter]
     )
 
     analyst = Agent(
         role="Analyst",
-        goal="Synthesize outputs, ensure correctness, and return the final formatted answer as per user request",
-        backstory="Data analyst who also ensures formatting correctness",
+        goal="Synthesize outputs, ensure correctness, and return the final formatted answer",
+        backstory="Data analyst who ensures formatting correctness",
         allow_delegation=False,
         verbose=True,
-        llm=chat_llm,
+        llm=analyst_llm,
         system_prompt=(
             "You are the final analyst. "
             "Your responsibilities include:\n"
             "1. Synthesizing outputs from previous steps.\n"
-            "2. Ensuring the final answer matches the format the user requested.\n"
+            "2. Ensuring the final answer matches the format requested.\n"
             "3. Wrapping the final output inside JSON if needed.\n"
             "4. If something fails, return: {\"answer\": \"Dummy response due to error or quota limit.\"}"
         ),
@@ -159,11 +157,11 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
     )
 
     file_context = (
-    f"The user uploaded files: " +
-    ", ".join([f"{name} (at {path})" for name, path in saved_files.items()])
-    if saved_files else
-    "No uploaded files beyond questions.txt."
-)
+        f"The user uploaded files: " +
+        ", ".join([f"{name} (at {path})" for name, path in saved_files.items()])
+        if saved_files else
+        "No uploaded files beyond questions.txt."
+    )
 
     tasks = [
         Task(description=f"{file_context}\n\nCreate a detailed plan for answering '{{question}}'.", agent=planner, expected_output="Step-by-step plan", stop_condition=stop_if_answered),
