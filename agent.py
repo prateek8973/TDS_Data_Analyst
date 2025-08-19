@@ -1,46 +1,100 @@
-from crewai import Agent, Task, Crew, Process
-from typing import Dict
-from tools import build_all_tools  # ⬅️ new: one place to assemble every tool
 import os
+
+# ---- Environment setup ----
+# Hugging Face Spaces writable dirs (both ephemeral here)
+TMP_DIR = "/tmp/.mem0"
+PERSIST_DIR = "/tmp/.embedchain"
+
+# Override embedchain + mem0 default paths
+os.environ["EMBEDCHAIN_CONFIG_DIR"] = PERSIST_DIR
+os.environ["MEM0_DIR"] = TMP_DIR
+os.environ["CREWAI_STORAGE_PATH"] = "/tmp/crewai_storage"
+os.environ["XDG_DATA_HOME"] = os.environ["CREWAI_STORAGE_PATH"]
+os.environ["HOME"] = "/tmp"
+# Make sure dirs exist
+os.makedirs(PERSIST_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(os.environ["CREWAI_STORAGE_PATH"], exist_ok=True)
+os.makedirs(os.path.join("/tmp", ".local", "share"), exist_ok=True)
+from crewai import Agent, Task, Crew, Process
+from crewai_tools import CodeInterpreterTool
+from typing import Dict
+from tools import build_all_tools
 import random
 from dotenv import load_dotenv
-from litellm import completion
 
 load_dotenv()
 
-# Collect all GOOGLE_API_KEY* env vars
-GOOGLE_API_KEYS = [
-    v for k, v in os.environ.items() if k.startswith("GOOGLE_API_KEY") and v
-]
+#  Load API keys
+GOOGLE_API_KEYS = [v for k, v in os.environ.items() if k.startswith("GOOGLE_API") and v]
 if not GOOGLE_API_KEYS:
     raise ValueError("No GOOGLE_API_KEY1/2/3 found in environment")
 
 def get_api_key() -> str:
-    """Return a random API key for load balancing."""
     return random.choice(GOOGLE_API_KEYS)
 
-# Wrapper function to pass to CrewAI as LLM
-class GeminiLLM:
-    def __init__(self, model="gemini/gemini-2.5-flash", temperature=0, api_key=None):
-        self.model = model
-        self.temperature = temperature
-        self.api_key = api_key or get_api_key()
+# Gemini LLM wrapper with fallback
+from litellm import completion
+import re
 
-    def __call__(self, prompt: str) -> str:
-        resp = completion(
-            model=self.model,
-            api_key=self.api_key,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature
-        )
-        return resp.choices[0].message.content
+class GeminiLLM:
+    def __init__(self, model="gemini/gemini-1.5-flash", api_key=None, temperature=0):
+        self.model = model
+        self.api_key = api_key
+        self.temperature = temperature
+
+    def __call__(self, prompt: str, image_base64: str = None):
+        """
+        If image_base64 is provided, sends multimodal request.
+        Otherwise, sends plain text request.
+        """
+
+        if image_base64:
+            # multimodal request: text + base64 image
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        else:
+            # text-only request
+            messages = [{"role": "user", "content": prompt}]
+
+        try:
+            resp = completion(
+                model=self.model,
+                api_key=self.api_key,
+                messages=messages,
+                temperature=self.temperature
+            )
+            return resp["choices"][0]["message"]["content"]
+        except Exception as e:
+            # fallback dummy JSON if API fails
+            return {
+                "status": "error",
+                "message": "LLM call failed",
+                "error": str(e),
+                "dummy_output": "No valid response due to API rate limit or failure."
+            }
+
+def stop_if_answered(output: str) -> bool:
+    return "FINAL ANSWER" in output
 
 def build_crew(workdir: str, saved_files: Dict[str, str]):
-    # ⬅️ Build one comprehensive toolset (includes GitHub, Serper, YouTube, file tools, scraping, PythonExec)
     all_tools = build_all_tools(workdir=workdir, saved_files=saved_files)
-
-    # Each crew gets a fresh LLM with a rotated key
     chat_llm = GeminiLLM(api_key=get_api_key())
+
+    # Initialize the Code Interpreter tool
+    code_interpreter = CodeInterpreterTool()
 
     planner = Agent(
         role="Planner",
@@ -50,26 +104,19 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         verbose=True,
         llm=chat_llm,
         memory=False,
-        system_prompt="""You are a meticulous planning agent.
-
-1) Identify exactly what the user needs.
-2) Use uploaded files when relevant; if the query also requires web/search/scraping/YouTube/GitHub, include them.
-3) Do NOT impose a fixed priority order. Combine multiple sources when needed (files + search + scraping + YouTube + GitHub).
-4) For each step: specify the tool, data to collect, validation checks, and calculations.
-5) Never fabricate data. Prefer focused scraping (selectors) over full-page dumps.
-""",
-        tools=all_tools  # ⬅️ give full toolset
+        system_prompt="You're a meticulous planning agent...",
+        tools=all_tools
     )
 
     developer = Agent(
         role="Developer",
-        goal="Write correct, sandbox-safe Python code for each sub-task",
+        goal="Write correct, sandbox-safe Python code",
         backstory="Senior Python engineer",
         allow_delegation=False,
         verbose=True,
         llm=chat_llm,
         system_prompt="You are a senior Python developer focused on accuracy.",
-        tools=all_tools  # ⬅️ full toolset available
+        tools=all_tools
     )
 
     reviewer = Agent(
@@ -80,97 +127,58 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
         verbose=True,
         llm=chat_llm,
         system_prompt="You are a strict code reviewer focused on correctness.",
-        tools=all_tools  # ⬅️ full toolset available
+        tools=all_tools
     )
 
     executor = Agent(
         role="Executor",
-        goal="Run reviewed code in sandbox and return outputs",
-        backstory="Execution agent",
+        goal="Run reviewed code and return outputs",
+        backstory="Execution agent with secure interpreter",
         allow_delegation=False,
         verbose=True,
         llm=chat_llm,
-        tools=all_tools  # ⬅️ can execute Python and also call search/scrape/GitHub/YouTube if the plan includes them
+        tools=[code_interpreter]  # Exclusive execution tool
     )
 
     analyst = Agent(
         role="Analyst",
-        goal="Synthesize outputs and produce final answer",
-        backstory="Data analyst",
+        goal="Synthesize outputs, ensure correctness, and return the final formatted answer as per user request",
+        backstory="Data analyst who also ensures formatting correctness",
         allow_delegation=False,
         verbose=True,
         llm=chat_llm,
-        system_prompt="You synthesize results into accurate final answers.",
-        tools=all_tools  # ⬅️ full toolset available (for ad-hoc lookups if needed)
+        system_prompt=(
+            "You are the final analyst. "
+            "Your responsibilities include:\n"
+            "1. Synthesizing outputs from previous steps.\n"
+            "2. Ensuring the final answer matches the format the user requested.\n"
+            "3. Wrapping the final output inside JSON if needed.\n"
+            "4. If something fails, return: {\"answer\": \"Dummy response due to error or quota limit.\"}"
+        ),
+        tools=all_tools
     )
 
-    reporter = Agent(
-        role="Reporter",
-        goal="Ensure output matches requested format",
-        backstory="Format validator",
-        allow_delegation=False,
-        verbose=True,
-        llm=chat_llm,
-        system_prompt="You validate and format the final answer.",
-        tools=all_tools  # ⬅️ full toolset available
-    )
+    file_context = (
+    f"The user uploaded files: " +
+    ", ".join([f"{name} (at {path})" for name, path in saved_files.items()])
+    if saved_files else
+    "No uploaded files beyond questions.txt."
+)
 
-    if saved_files:
-        file_context = (
-            "The user has uploaded the following files for analysis: "
-            f"{', '.join(saved_files.keys())}. Use these wherever relevant."
-        )
-    else:
-        file_context = (
-            "The user has not uploaded any data files beyond questions.txt. "
-            "You may use web/search/scraping/YouTube/GitHub tools as needed."
-        )
-
-    t1 = Task(
-        description=f"""
-{file_context}
-
-Create a detailed, step-by-step plan to answer the user's question.
-The user's question is: '{{{{question}}}}'
-""",
-        agent=planner,
-        expected_output="Step-by-step plan with filenames, tools, and validation steps."
-    )
-
-    t2 = Task(
-        description="Using the plan, write Python code snippets where needed.",
-        agent=developer,
-        expected_output="JSON list of code objects."
-    )
-
-    t3 = Task(
-        description="Review developer's code and correct if necessary.",
-        agent=reviewer,
-        expected_output="'APPROVED' or corrected JSON."
-    )
-
-    t4 = Task(
-        description="Execute the code list and/or fetch data via the planned tools.",
-        agent=executor,
-        expected_output="JSON list of execution results or retrieved data."
-    )
-
-    t5 = Task(
-        description="Synthesize results into the final answer.",
-        agent=analyst,
-        expected_output="Final answer only."
-    )
-
-    t6 = Task(
-        description="Validate final output formatting.",
-        agent=reporter,
-        expected_output="Corrected, format-compliant output."
-    )
+    tasks = [
+        Task(description=f"{file_context}\n\nCreate a detailed plan for answering '{{question}}'.", agent=planner, expected_output="Step-by-step plan", stop_condition=stop_if_answered),
+        Task(description="Write Python code snippets where needed.", agent=developer, expected_output="Python code implementing the solution", stop_condition=stop_if_answered),
+        Task(description="Review developer's code.", agent=reviewer, expected_output="Reviewed and corrected code", stop_condition=stop_if_answered),
+        Task(description="Execute code and/or fetch data.", agent=executor, expected_output="Execution results", stop_condition=stop_if_answered),
+        Task(description="Synthesize results into final formatted answer.", agent=analyst, expected_output="Final formatted answer matching user request", stop_condition=stop_if_answered),
+    ]
 
     crew = Crew(
-        agents=[planner, developer, reviewer, executor, analyst, reporter],
-        tasks=[t1, t2, t3, t4, t5, t6],
+        agents=[planner, developer, reviewer, executor, analyst],
+        tasks=tasks,
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        max_iterations=1
     )
+
     return crew
