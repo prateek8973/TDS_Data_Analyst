@@ -28,11 +28,11 @@ load_dotenv()
 #  Load API keys
 # ---- Load dedicated API keys for each agent ----
 AGENT_API_KEYS = {
-    "Planner": os.environ.get("GOOGLE_APIKEY_1"),
-    "Developer": os.environ.get("GOOGLE_APIKEY_2"),
-    "Reviewer": os.environ.get("GOOGLE_APIKEY_3"),
-    "Executor": os.environ.get("GOOGLE_APIKEY_4"),
-    "Analyst": os.environ.get("GOOGLE_APIKEY_5"),
+    "Planner": os.environ.get("GOOGLE_API_KEY1"),
+    "Developer": os.environ.get("GOOGLE_API_KEY2"),
+    "Reviewer": os.environ.get("GOOGLE_API_KEY3"),
+    "Executor": os.environ.get("GOOGLE_API_KEY4"),
+    "Analyst": os.environ.get("GOOGLE_API_KEY5"),
 }
 
 for agent, key in AGENT_API_KEYS.items():
@@ -180,4 +180,5 @@ def build_crew(workdir: str, saved_files: Dict[str, str]):
     )
 
     return crew
+
 
